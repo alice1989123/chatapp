@@ -1,3 +1,4 @@
+// src/ChatApp.tsx
 import { useMemo, useState } from "react";
 import {
   AssistantRuntimeProvider,
@@ -7,24 +8,26 @@ import {
 } from "@assistant-ui/react";
 import { Thread } from "@assistant-ui/react-ui";
 
-// Extract latest user text message from assistant-ui thread messages
+// Extract the latest user text from assistant-ui thread messages
 function getLastUserText(messages: readonly ThreadMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.role !== "user") continue;
 
     const parts = (m.content ?? []) as any[];
-    const textPart = parts.find((p) => p?.type === "text" && typeof p?.text === "string");
+    const textPart = parts.find(
+      (p) => p?.type === "text" && typeof p?.text === "string"
+    );
     if (textPart?.text) return String(textPart.text);
   }
   return "";
 }
 
 export default function ChatApp({ accessToken }: { accessToken: string }) {
-  const API_BASE = import.meta.env.VITE_API_BASE;
+  const API_BASE = import.meta.env.VITE_API_BASE as string | undefined;
 
-  // Persist threadId across refresh without localStorage:
-  // for now: keep in state (refresh resets). Next: load from backend GET /threads/latest.
+  // NOTE: This persists only while the tab is alive.
+  // Next step (no localStorage): load last thread via backend on mount.
   const [threadId, setThreadId] = useState<string | null>(null);
 
   const adapter: ChatModelAdapter = useMemo(
@@ -48,7 +51,11 @@ export default function ChatApp({ accessToken }: { accessToken: string }) {
           return { content: [{ type: "text", text: "(no user text found to send)" }] };
         }
 
-        const clientMsgId = crypto.randomUUID();
+        // Browser-safe UUID (no Node crypto import needed)
+        const clientMsgId =
+          typeof globalThis.crypto?.randomUUID === "function"
+            ? globalThis.crypto.randomUUID()
+            : `c_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
         const resp = await fetch(`${API_BASE}/chat`, {
           method: "POST",
@@ -58,9 +65,9 @@ export default function ChatApp({ accessToken }: { accessToken: string }) {
             Authorization: `Bearer ${accessToken}`,
           },
           body: JSON.stringify({
-            threadId,      // null means “create a new thread”
-            text,          // only the latest user text
-            clientMsgId,   // idempotency
+            threadId, // null => create a new thread
+            text, // only latest user message
+            clientMsgId, // idempotency key
           }),
         });
 
@@ -69,7 +76,7 @@ export default function ChatApp({ accessToken }: { accessToken: string }) {
         try {
           data = JSON.parse(raw);
         } catch {
-          // leave as null
+          // non-json response; keep raw
         }
 
         if (!resp.ok) {

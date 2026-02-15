@@ -1,3 +1,4 @@
+// src/App.tsx  (just to show the wiring)
 import { useAuth } from "react-oidc-context";
 import AuthCallback from "./AuthCallback";
 import ChatApp from "./ChatApp";
@@ -26,8 +27,6 @@ export default function App() {
   }
 
   const signOutRedirect = () => {
-    console.log("isAuthenticated", auth.isAuthenticated);
-    console.log("has access token", Boolean(auth.user?.access_token));
     window.location.href =
       `${cognitoDomain}/logout?client_id=${clientId}&logout_uri=${encodeURIComponent(logoutUri)}`;
   };
