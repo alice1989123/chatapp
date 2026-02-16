@@ -31,16 +31,25 @@ export default function App() {
       `${cognitoDomain}/logout?client_id=${clientId}&logout_uri=${encodeURIComponent(logoutUri)}`;
   };
 
-  const accessToken = auth.user?.access_token ?? "";
-  if (!accessToken) {
-    return (
-      <div style={{ padding: 24 }}>
-        Signed in, but no access token found.
+ const accessToken = auth.user?.access_token ?? "";
+const idToken = auth.user?.id_token ?? "";
+
+if (!accessToken || !idToken) {
+  return (
+    <div style={{ padding: 24 }}>
+      Signed in, but missing token(s).
+      <div style={{ marginTop: 8, fontFamily: "monospace", fontSize: 12 }}>
+        access_token: {accessToken ? `len ${accessToken.length}` : "MISSING"}
+        <br />
+        id_token: {idToken ? `len ${idToken.length}` : "MISSING"}
+      </div>
+      <div style={{ marginTop: 12 }}>
         <button onClick={() => auth.removeUser()}>Reset local session</button>{" "}
         <button onClick={signOutRedirect}>Cognito sign out</button>
       </div>
-    );
-  }
+    </div>
+  );
+}
 
-  return <ChatApp accessToken={accessToken} />;
+return <ChatApp accessToken={accessToken} idToken={idToken} />;
 }
