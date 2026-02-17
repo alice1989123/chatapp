@@ -38,25 +38,6 @@ function safeUUID(): string {
     : `c_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-function decodeJwtPayload(token: string): any | null {
-  try {
-    const p = token.split(".")[1];
-    if (!p) return null;
-
-    // base64url -> base64 + proper padding
-    const base64 = p.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64.padEnd(
-      base64.length + ((4 - (base64.length % 4)) % 4),
-      "="
-    );
-
-    const json = atob(padded);
-    return JSON.parse(json);
-  } catch {
-    return null;
-  }
-}
-
 async function fetchJson(url: string, init: RequestInit): Promise<any> {
   const r = await fetch(url, init);
   const raw = await r.text();
@@ -84,11 +65,15 @@ function Composer({
   onSend,
   streamEnabled,
   onToggleStream,
+  webEnabled,
+  onToggleWeb,
 }: {
   disabled?: boolean;
   onSend: (text: string) => Promise<void>;
   streamEnabled: boolean;
   onToggleStream: (v: boolean) => void;
+  webEnabled: boolean;
+  onToggleWeb: (v: boolean) => void;
 }) {
   const [text, setText] = useState("");
 
@@ -151,6 +136,32 @@ function Composer({
         Stream
       </label>
 
+      <label
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          fontSize: 12,
+          opacity: disabled ? 0.5 : 0.9,
+          userSelect: "none",
+          cursor: disabled ? "not-allowed" : "pointer",
+          border: "1px solid #333",
+          borderRadius: 10,
+          padding: "8px 10px",
+          background: "#111",
+        }}
+        title="Allow backend web search (backend must support this flag)"
+      >
+        <input
+          type="checkbox"
+          checked={webEnabled}
+          disabled={disabled}
+          onChange={(e) => onToggleWeb(e.target.checked)}
+          style={{ cursor: disabled ? "not-allowed" : "pointer" }}
+        />
+        Web
+      </label>
+
       <button
         type="submit"
         disabled={disabled}
@@ -177,9 +188,7 @@ export default function ChatApp({
   idToken: string;
 }) {
   const API_BASE = import.meta.env.VITE_API_BASE as string | undefined;
-  const STREAM_API_BASE = import.meta.env.VITE_STREAM_API_BASE as
-    | string
-    | undefined;
+  const STREAM_API_BASE = import.meta.env.VITE_STREAM_API_BASE as string | undefined;
 
   const [threadId, setThreadId] = useState<string | null>(null);
 
@@ -192,18 +201,14 @@ export default function ChatApp({
   const [hydrateError, setHydrateError] = useState<string | null>(null);
 
   const [streamEnabled, setStreamEnabled] = useState(true);
+  const [webEnabled, setWebEnabled] = useState(true);
 
-  // --- NEW: small "copied" toast per code-block key
+  // copied toast
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   function copyToClipboard(text: string, key: string) {
     const s = String(text ?? "");
     if (!s) return;
-
-    // navigator.clipboard is secure-context only; fallback to execCommand.
-    const tryModern = async () => {
-      await navigator.clipboard.writeText(s);
-    };
 
     const fallback = () => {
       const ta = document.createElement("textarea");
@@ -220,19 +225,15 @@ export default function ChatApp({
 
     (async () => {
       try {
-        if (navigator.clipboard?.writeText) await tryModern();
+        if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(s);
         else fallback();
         setCopiedKey(key);
-        window.setTimeout(() => {
-          setCopiedKey((k) => (k === key ? null : k));
-        }, 1200);
+        window.setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 1200);
       } catch {
         try {
           fallback();
           setCopiedKey(key);
-          window.setTimeout(() => {
-            setCopiedKey((k) => (k === key ? null : k));
-          }, 1200);
+          window.setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 1200);
         } catch {
           // ignore
         }
@@ -240,7 +241,7 @@ export default function ChatApp({
     })();
   }
 
-  // Always points to the *currently visible* thread.
+  // Always points to the currently visible thread.
   const activeThreadRef = useRef<string | null>(null);
 
   // One in-flight request at a time (especially important for streaming).
@@ -262,19 +263,6 @@ export default function ChatApp({
     [idToken]
   );
 
-  useEffect(() => {
-    // Debug sanity: access vs id token
-    const a = decodeJwtPayload(accessToken);
-    const i = decodeJwtPayload(idToken);
-    console.log(
-      "token_use(accessToken):",
-      a?.token_use,
-      "len",
-      accessToken?.length
-    );
-    console.log("token_use(idToken):", i?.token_use, "len", idToken?.length);
-  }, [accessToken, idToken]);
-
   function abortInFlight() {
     try {
       inFlightAbortRef.current?.abort();
@@ -282,7 +270,6 @@ export default function ChatApp({
     inFlightAbortRef.current = null;
   }
 
-  // Abort any in-flight stream if user switches threads or unmounts.
   useEffect(() => {
     return () => abortInFlight();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -312,7 +299,6 @@ export default function ChatApp({
 
     const tid = String(out?.threadId ?? "");
     if (tid) {
-      // switching thread: abort any in-flight request first
       abortInFlight();
       setThreadId(tid);
       await refreshThreads();
@@ -322,7 +308,6 @@ export default function ChatApp({
   async function hydrateThread(tid: string) {
     if (!API_BASE) return;
 
-    // switching thread: abort any in-flight request first
     abortInFlight();
     activeThreadRef.current = tid;
 
@@ -356,30 +341,24 @@ export default function ChatApp({
       clientMsgId,
     };
     setHistory((h) => [...h, userMsg]);
-    return { clientMsgId, userMsg };
+    return { clientMsgId };
   }
 
-  function appendAssistantPlaceholder() {
+  function appendAssistantPlaceholder(initial = "Thinking…") {
     const assistantId = `m_${safeUUID()}`;
     setHistory((h) => [
       ...h,
-      { id: assistantId, ts: Date.now(), role: "assistant", text: "" },
+      { id: assistantId, ts: Date.now(), role: "assistant", text: initial },
     ]);
     return assistantId;
   }
 
   function updateAssistantText(assistantId: string, text: string) {
-    setHistory((h) =>
-      h.map((m) => (m.id === assistantId ? { ...m, text } : m))
-    );
+    setHistory((h) => h.map((m) => (m.id === assistantId ? { ...m, text } : m)));
   }
 
   function replaceAssistantWithError(assistantId: string, message: string) {
-    setHistory((h) =>
-      h.map((m) =>
-        m.id === assistantId ? { ...m, text: `⚠️ ${message}` } : m
-      )
-    );
+    updateAssistantText(assistantId, `⚠️ ${message}`);
   }
 
   async function sendMessageNonStream(text: string, tid: string) {
@@ -387,7 +366,7 @@ export default function ChatApp({
 
     abortInFlight();
     const { clientMsgId } = appendOptimisticUser(text);
-    const assistantId = appendAssistantPlaceholder();
+    const assistantId = appendAssistantPlaceholder("Thinking…");
 
     const controller = new AbortController();
     inFlightAbortRef.current = controller;
@@ -397,14 +376,13 @@ export default function ChatApp({
         method: "POST",
         signal: controller.signal,
         headers: { ...headersAccess, "Content-Type": "application/json" },
-        body: JSON.stringify({ threadId: tid, text, clientMsgId }),
+        body: JSON.stringify({ threadId: tid, text, clientMsgId, web: webEnabled }),
       });
 
-      // only update if still on same thread
       if (activeThreadRef.current !== tid) return;
 
       const assistantText = String(data?.text ?? "");
-      updateAssistantText(assistantId, assistantText);
+      updateAssistantText(assistantId, assistantText || "(empty response)");
       refreshThreads().catch(() => {});
     } catch (e: any) {
       if (isAbortError(e) || activeThreadRef.current !== tid) return;
@@ -415,25 +393,52 @@ export default function ChatApp({
     }
   }
 
+  /**
+   * Streaming: assumes the backend streams raw text chunks.
+   * Adds:
+   *  - first-byte timeout (8s)
+   *  - no-progress timeout (25s)
+   *  - clean fallback behavior
+   */
   async function sendMessageStream(text: string, tid: string) {
     if (!STREAM_API_BASE) throw new Error("Missing VITE_STREAM_API_BASE");
 
     abortInFlight();
     const { clientMsgId } = appendOptimisticUser(text);
-    const assistantId = appendAssistantPlaceholder();
+    const assistantId = appendAssistantPlaceholder("Thinking…");
 
     const controller = new AbortController();
     inFlightAbortRef.current = controller;
+
+    // timers
+    let firstByteTimer: number | null = null;
+    let progressTimer: number | null = null;
+
+    const clearTimers = () => {
+      if (firstByteTimer) window.clearTimeout(firstByteTimer);
+      if (progressTimer) window.clearTimeout(progressTimer);
+      firstByteTimer = null;
+      progressTimer = null;
+    };
+
+    const armProgressTimeout = () => {
+      if (progressTimer) window.clearTimeout(progressTimer);
+      progressTimer = window.setTimeout(() => {
+        try {
+          controller.abort();
+        } catch {}
+      }, 25_000);
+    };
 
     try {
       const r = await fetch(`${STREAM_API_BASE}/chat`, {
         method: "POST",
         signal: controller.signal,
         headers: {
-          ...headersId, // IMPORTANT: your REST authorizer expects ID token
+          ...headersId, // stream authorizer expects ID token (your note)
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ threadId: tid, text, clientMsgId }),
+        body: JSON.stringify({ threadId: tid, text, clientMsgId, web: webEnabled }),
       });
 
       if (!r.ok || !r.body) {
@@ -441,64 +446,80 @@ export default function ChatApp({
         throw new Error(`HTTP ${r.status}: ${raw || r.statusText}`);
       }
 
-      // Stream reader
       const reader = r.body.getReader();
       const decoder = new TextDecoder();
 
-      // Optional: show a tiny heartbeat immediately so UI feels alive
-      let acc = "Thinking...\n";
+      let acc = "";
+      let gotAnyByte = false;
 
-      // Write initial text quickly
-      if (activeThreadRef.current === tid) updateAssistantText(assistantId, acc);
+      // If nothing arrives soon, abort -> fallback
+      firstByteTimer = window.setTimeout(() => {
+        try {
+          controller.abort();
+        } catch {}
+      }, 8_000);
+
+      armProgressTimeout();
 
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
 
-        // If user switched threads mid-stream, stop reading to avoid wasted work
         if (activeThreadRef.current !== tid) {
           try {
             await reader.cancel();
           } catch {}
+          clearTimers();
           return;
+        }
+
+        if (value && value.length) {
+          gotAnyByte = true;
+          if (firstByteTimer) {
+            window.clearTimeout(firstByteTimer);
+            firstByteTimer = null;
+          }
+          armProgressTimeout();
         }
 
         const chunk = decoder.decode(value, { stream: true });
         acc += chunk;
 
-        // Update the placeholder message in-place
-        updateAssistantText(assistantId, acc);
+        // show something even if backend sends whitespace/newlines
+        updateAssistantText(assistantId, acc || "Thinking…");
+      }
+
+      clearTimers();
+
+      if (activeThreadRef.current !== tid) return;
+
+      // stream ended but sent nothing
+      if (!gotAnyByte && !acc.trim()) {
+        updateAssistantText(assistantId, "⚠️ stream ended with no content");
       }
 
       refreshThreads().catch(() => {});
     } catch (e: any) {
+      clearTimers();
       if (isAbortError(e) || activeThreadRef.current !== tid) return;
-
-      // Network errors during streaming are common; surface them nicely.
-      replaceAssistantWithError(
-        assistantId,
-        `streaming failed: ${e?.message ?? String(e)}`
-      );
-
+      replaceAssistantWithError(assistantId, `streaming failed: ${e?.message ?? String(e)}`);
       throw e;
     } finally {
+      clearTimers();
       if (inFlightAbortRef.current === controller) inFlightAbortRef.current = null;
     }
   }
 
   async function onSend(text: string) {
     if (!threadId) throw new Error("No thread selected");
-
-    // Capture tid at send time; and mark it as the active thread for this operation.
     const tid = threadId;
     activeThreadRef.current = tid;
 
-    if (streamEnabled) {
+    if (streamEnabled && STREAM_API_BASE) {
       try {
         await sendMessageStream(text, tid);
         return;
       } catch (e: any) {
-        // If streaming fails, do a clean non-stream retry (same thread, new request).
         if (activeThreadRef.current !== tid) return;
         setHistory((h) => [
           ...h,
@@ -506,9 +527,7 @@ export default function ChatApp({
             id: `m_${safeUUID()}`,
             ts: Date.now(),
             role: "assistant",
-            text: `⚠️ streaming failed, falling back to non-stream.\n${
-              e?.message ?? String(e)
-            }`,
+            text: `⚠️ streaming failed, falling back to non-stream.\n${e?.message ?? String(e)}`,
           },
         ]);
       }
@@ -532,7 +551,6 @@ export default function ChatApp({
 
         const initial = items?.[0]?.threadId ?? null;
         if (initial && !threadId) {
-          // switching thread: abort any in-flight request first
           abortInFlight();
           setThreadId(initial);
         }
@@ -693,8 +711,7 @@ export default function ChatApp({
                   style={{
                     marginBottom: 10,
                     display: "flex",
-                    justifyContent:
-                      m.role === "user" ? "flex-end" : "flex-start",
+                    justifyContent: m.role === "user" ? "flex-end" : "flex-start",
                   }}
                 >
                   <div
@@ -714,38 +731,28 @@ export default function ChatApp({
                         remarkPlugins={[remarkGfm]}
                         rehypePlugins={[rehypeHighlight]}
                         components={{
-                          code: ({ inline, className, children, ...props }) => {
-                            const codeText = String(children ?? "").replace(
-                              /\n$/,
-                              ""
-                            );
+                          // ✅ FIX: Put copy button on <pre>, not in code() (prevents nested <pre>)
+                          pre({ children }) {
+                            // children usually: <code className=...>...</code>
+                            const codeNode: any = Array.isArray(children)
+                              ? children[0]
+                              : children;
 
-                            if (inline) {
-                              return (
-                                <code
-                                  style={{
-                                    background: "#111",
-                                    border: "1px solid #333",
-                                    padding: "2px 6px",
-                                    borderRadius: 8,
-                                    fontFamily:
-                                      "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                                    fontSize: 13,
-                                  }}
-                                  {...props}
-                                >
-                                  {children}
-                                </code>
-                              );
-                            }
+                            const raw =
+                              typeof codeNode?.props?.children === "string"
+                                ? codeNode.props.children
+                                : Array.isArray(codeNode?.props?.children)
+                                ? codeNode.props.children.join("")
+                                : "";
 
-                            const key = `${m.id}:${className || "code"}:${codeText.length}`;
+                            const codeText = String(raw ?? "").replace(/\n$/, "");
+                            const key = `${m.id}:pre:${codeText.length}`;
 
                             return (
-                              <div style={{ position: "relative", marginTop: 8, marginBottom: 8 }}>
+                              <div style={{ position: "relative", margin: "8px 0" }}>
                                 <button
                                   type="button"
-                                  onClick={() => copyToClipboard(codeText, key)}
+                                  onClick={() => codeText && copyToClipboard(codeText, key)}
                                   style={{
                                     position: "absolute",
                                     top: 8,
@@ -756,9 +763,11 @@ export default function ChatApp({
                                     background: "rgba(17,17,17,0.9)",
                                     color: "white",
                                     fontSize: 12,
-                                    cursor: "pointer",
+                                    cursor: codeText ? "pointer" : "not-allowed",
+                                    opacity: codeText ? 1 : 0.6,
                                   }}
                                   title="Copy code"
+                                  disabled={!codeText}
                                 >
                                   {copiedKey === key ? "Copied ✓" : "Copy"}
                                 </button>
@@ -769,23 +778,52 @@ export default function ChatApp({
                                     border: "1px solid #333",
                                     borderRadius: 12,
                                     padding: 12,
-                                    paddingTop: 40, // leave room for button
+                                    paddingTop: 40,
                                     overflowX: "auto",
                                     margin: 0,
                                   }}
                                 >
-                                  <code className={className} {...props}>
-                                    {children}
-                                  </code>
+                                  {children}
                                 </pre>
                               </div>
                             );
                           },
+
+                          // Inline code styling only; block code stays inside <pre>
+                          code({ className, children, ...props }) {
+                            const isInline = !className; // heuristic: block code gets className like "language-ts"
+                            if (!isInline) {
+                              return (
+                                <code className={className} {...props}>
+                                  {children}
+                                </code>
+                              );
+                            }
+
+                            return (
+                              <code
+                                style={{
+                                  background: "#111",
+                                  border: "1px solid #333",
+                                  padding: "2px 6px",
+                                  borderRadius: 8,
+                                  fontFamily:
+                                    "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                                  fontSize: 13,
+                                }}
+                                {...props}
+                              >
+                                {children}
+                              </code>
+                            );
+                          },
+
+                          // ✅ Avoid <p> wrapping block-level things; use div for paragraphs
                           p({ children }) {
                             return (
-                              <p style={{ margin: "6px 0", whiteSpace: "pre-wrap" }}>
+                              <div style={{ margin: "6px 0", whiteSpace: "pre-wrap" }}>
                                 {children}
-                              </p>
+                              </div>
                             );
                           },
                           li({ children }) {
@@ -812,6 +850,8 @@ export default function ChatApp({
             onSend={onSend}
             streamEnabled={streamEnabled}
             onToggleStream={setStreamEnabled}
+            webEnabled={webEnabled}
+            onToggleWeb={setWebEnabled}
           />
         </div>
       </div>
