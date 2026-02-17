@@ -66,6 +66,19 @@ async function fetchJson(url: string, init: RequestInit): Promise<any> {
   return data;
 }
 
+function sleep(ms: number) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+function normalizeText(s: any) {
+  return String(s ?? "");
+}
+
+function looksLikeBrowsingPlaceholder(s: string) {
+  const t = s.trim().toLowerCase();
+  return t === "[browsing...]" || t.startsWith("[browsing");
+}
+
 /* =========================
    Clipboard hook
 ========================= */
@@ -169,7 +182,9 @@ function makeApi({
           threadId: args.threadId,
           text: args.text,
           clientMsgId: args.clientMsgId,
+          // send both (some backends use one name)
           web: args.web,
+          browse: args.web,
         }),
       });
     },
@@ -194,6 +209,7 @@ function makeApi({
           text: args.text,
           clientMsgId: args.clientMsgId,
           web: args.web,
+          browse: args.web,
         }),
       });
     },
@@ -225,6 +241,103 @@ function createStreamTimers() {
   };
 
   return { clear, armFirstByte, armProgress };
+}
+
+/* =========================
+   Stream decoder:
+   - Supports AWS Lambda response streaming meta+8zero delimiter
+   - Also supports plain-text streaming (no delimiter)
+========================= */
+function createHybridStreamDecoder() {
+  const DELIM = new Uint8Array(8); // 8 zero bytes
+  const td = new TextDecoder();
+
+  let startedBody = false;
+  let decidedPlainText = false;
+  let buf = new Uint8Array(0);
+
+  function concat(a: Uint8Array, b: Uint8Array) {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+  }
+
+  function indexOfSubarray(hay: Uint8Array, needle: Uint8Array) {
+    outer: for (let i = 0; i <= hay.length - needle.length; i++) {
+      for (let j = 0; j < needle.length; j++) {
+        if (hay[i + j] !== needle[j]) continue outer;
+      }
+      return i;
+    }
+    return -1;
+  }
+
+  // If delimiter never appears, don't buffer forever.
+  const MAX_META_BYTES = 32 * 1024; // 32KB is plenty for meta
+
+  function firstNonWhitespaceByte(u8: Uint8Array) {
+    for (let i = 0; i < u8.length; i++) {
+      const c = u8[i];
+      // whitespace bytes: space/tab/cr/lf
+      if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) continue;
+      return c;
+    }
+    return null;
+  }
+
+  return {
+    push(bytes?: Uint8Array | null): { text: string; meta?: any } {
+      if (!bytes || bytes.length === 0) return { text: "" };
+
+      buf = concat(buf, bytes);
+
+      // Heuristic: if the first non-whitespace byte is NOT "{",
+      // then this is almost certainly plain text streaming, not meta JSON.
+      if (!startedBody && !decidedPlainText) {
+        const b = firstNonWhitespaceByte(buf);
+        if (b !== null && b !== 0x7b /* "{" */) {
+          decidedPlainText = true;
+          startedBody = true;
+        }
+      }
+
+      if (!startedBody) {
+        if (buf.length > MAX_META_BYTES) {
+          // treat as body if meta is too large / delimiter missing
+          startedBody = true;
+          const text = td.decode(buf, { stream: true });
+          buf = new Uint8Array(0);
+          return { text };
+        }
+
+        const at = indexOfSubarray(buf, DELIM);
+        if (at === -1) {
+          return { text: "" };
+        }
+
+        let meta: any = undefined;
+        try {
+          const metaStr = td.decode(buf.slice(0, at));
+          meta = JSON.parse(metaStr);
+        } catch {
+          // ignore
+        }
+
+        const bodyBytes = buf.slice(at + DELIM.length);
+        buf = new Uint8Array(0);
+        startedBody = true;
+
+        const text = bodyBytes.length ? td.decode(bodyBytes, { stream: true }) : "";
+        return { text, meta };
+      }
+
+      // Body mode (plain or post-delim)
+      const text = td.decode(buf, { stream: true });
+      buf = new Uint8Array(0);
+      return { text };
+    },
+  };
 }
 
 /* =========================
@@ -342,7 +455,7 @@ function AssistantMarkdown({
 }
 
 /* =========================
-   Composer component (unchanged API)
+   Composer component
 ========================= */
 function Composer({
   disabled,
@@ -503,10 +616,7 @@ function useChatRuntime({
   const [hydrating, setHydrating] = useState(false);
   const [hydrateError, setHydrateError] = useState<string | null>(null);
 
-  // Always points to currently visible thread
   const activeThreadRef = useRef<string | null>(null);
-
-  // One in-flight request at a time
   const inFlightAbortRef = useRef<AbortController | null>(null);
 
   const abortInFlight = useCallback(() => {
@@ -577,7 +687,7 @@ function useChatRuntime({
       clientMsgId,
     };
     setHistory((h) => [...h, userMsg]);
-    return { clientMsgId };
+    return { clientMsgId, userTs: userMsg.ts };
   }, []);
 
   const appendAssistantPlaceholder = useCallback((initial = "Thinking…") => {
@@ -597,10 +707,51 @@ function useChatRuntime({
     [updateAssistantText]
   );
 
+  // Poll thread until we see a newer assistant message that isn't the placeholder
+  const pollForFinalAssistant = useCallback(
+    async (tid: string, userTs: number, assistantId: string, signal: AbortSignal) => {
+      const deadline = Date.now() + 60_000; // 60s max
+      let lastSeen = "";
+
+      while (Date.now() < deadline) {
+        if (signal.aborted) return;
+
+        try {
+          const thread = await api.getThread(tid);
+          if (signal.aborted) return;
+          if (activeThreadRef.current !== tid) return;
+
+          const msgs = Array.isArray(thread?.messages) ? thread.messages : [];
+          // Find the first assistant message after the user's send timestamp
+          const candidates = msgs
+            .filter((m) => m.role === "assistant" && typeof m.ts === "number" && m.ts >= userTs)
+            .sort((a, b) => a.ts - b.ts);
+
+          const latest = candidates[candidates.length - 1];
+          const text = normalizeText(latest?.text);
+
+          // stop when we get something real and different
+          if (text && !looksLikeBrowsingPlaceholder(text) && text !== "Thinking…" && text !== lastSeen) {
+            updateAssistantText(assistantId, text);
+            refreshThreads().catch(() => {});
+            return;
+          }
+
+          if (text) lastSeen = text;
+        } catch {
+          // ignore transient
+        }
+
+        await sleep(1200);
+      }
+    },
+    [api, refreshThreads, updateAssistantText]
+  );
+
   const sendMessageNonStream = useCallback(
     async (text: string, tid: string) => {
       abortInFlight();
-      const { clientMsgId } = appendOptimisticUser(text);
+      const { clientMsgId, userTs } = appendOptimisticUser(text);
       const assistantId = appendAssistantPlaceholder("Thinking…");
 
       const controller = new AbortController();
@@ -617,9 +768,15 @@ function useChatRuntime({
 
         if (activeThreadRef.current !== tid) return;
 
-        const assistantText = String(data?.text ?? "");
-        updateAssistantText(assistantId, assistantText || "(empty response)");
-        refreshThreads().catch(() => {});
+        const assistantText = normalizeText(data?.text);
+        if (!assistantText || looksLikeBrowsingPlaceholder(assistantText)) {
+          // Show what we got, then poll for the real answer
+          if (assistantText) updateAssistantText(assistantId, assistantText);
+          await pollForFinalAssistant(tid, userTs, assistantId, controller.signal);
+        } else {
+          updateAssistantText(assistantId, assistantText);
+          refreshThreads().catch(() => {});
+        }
       } catch (e: any) {
         if (isAbortError(e) || activeThreadRef.current !== tid) return;
         replaceAssistantWithError(assistantId, e?.message ?? String(e));
@@ -637,13 +794,14 @@ function useChatRuntime({
       updateAssistantText,
       replaceAssistantWithError,
       refreshThreads,
+      pollForFinalAssistant,
     ]
   );
 
   const sendMessageStream = useCallback(
     async (text: string, tid: string) => {
       abortInFlight();
-      const { clientMsgId } = appendOptimisticUser(text);
+      const { clientMsgId, userTs } = appendOptimisticUser(text);
       const assistantId = appendAssistantPlaceholder("Thinking…");
 
       const controller = new AbortController();
@@ -671,10 +829,11 @@ function useChatRuntime({
         }
 
         const reader = r.body.getReader();
-        const decoder = new TextDecoder();
+        const decoder = createHybridStreamDecoder();
 
         let acc = "";
         let gotAnyByte = false;
+        let sawAnyText = false;
 
         timers.armFirstByte(8_000, abort);
         timers.armProgress(25_000, abort);
@@ -696,15 +855,40 @@ function useChatRuntime({
             timers.armProgress(25_000, abort);
           }
 
-          const chunk = decoder.decode(value, { stream: true });
-          acc += chunk;
-          updateAssistantText(assistantId, acc || "Thinking…");
+          const { text: chunkText } = decoder.push(value);
+
+          if (chunkText) {
+            sawAnyText = true;
+            acc += chunkText;
+            updateAssistantText(assistantId, acc || "Thinking…");
+          }
         }
 
         timers.clear();
 
         if (activeThreadRef.current !== tid) return;
-        if (!gotAnyByte && !acc.trim()) updateAssistantText(assistantId, "⚠️ stream ended with no content");
+
+        const finalText = acc.trim();
+
+        // If the stream never produced text (decoder mismatch previously),
+        // OR if it only produced the browsing placeholder, poll for final message.
+        if (!gotAnyByte) {
+          updateAssistantText(assistantId, "⚠️ stream ended with no content");
+          return;
+        }
+
+        if (!sawAnyText) {
+          // We got bytes but decoded nothing -> poll
+          await pollForFinalAssistant(tid, userTs, assistantId, controller.signal);
+          return;
+        }
+
+        if (!finalText || looksLikeBrowsingPlaceholder(finalText)) {
+          // Show placeholder, then poll for real stored answer
+          if (finalText) updateAssistantText(assistantId, finalText);
+          await pollForFinalAssistant(tid, userTs, assistantId, controller.signal);
+          return;
+        }
 
         refreshThreads().catch(() => {});
       } catch (e: any) {
@@ -726,6 +910,7 @@ function useChatRuntime({
       updateAssistantText,
       replaceAssistantWithError,
       refreshThreads,
+      pollForFinalAssistant,
     ]
   );
 
@@ -805,7 +990,6 @@ function useChatRuntime({
     refreshThreads,
     createNewThread,
     history,
-    setHistory,
     hydrating,
     hydrateError,
     abortInFlight,
@@ -871,14 +1055,7 @@ export default function ChatApp({
       }}
     >
       {/* Sidebar */}
-      <div
-        style={{
-          width: 320,
-          borderRight: "1px solid #222",
-          padding: 12,
-          overflow: "auto",
-        }}
-      >
+      <div style={{ width: 320, borderRight: "1px solid #222", padding: 12, overflow: "auto" }}>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <div style={{ fontWeight: 700 }}>Threads</div>
           <button
