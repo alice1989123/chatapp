@@ -1,5 +1,9 @@
 // src/ChatApp.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import "highlight.js/styles/github-dark.css";
 
 type ThreadMeta = {
   threadId: string;
@@ -41,7 +45,10 @@ function decodeJwtPayload(token: string): any | null {
 
     // base64url -> base64 + proper padding
     const base64 = p.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
+    const padded = base64.padEnd(
+      base64.length + ((4 - (base64.length % 4)) % 4),
+      "="
+    );
 
     const json = atob(padded);
     return JSON.parse(json);
@@ -170,7 +177,9 @@ export default function ChatApp({
   idToken: string;
 }) {
   const API_BASE = import.meta.env.VITE_API_BASE as string | undefined;
-  const STREAM_API_BASE = import.meta.env.VITE_STREAM_API_BASE as string | undefined;
+  const STREAM_API_BASE = import.meta.env.VITE_STREAM_API_BASE as
+    | string
+    | undefined;
 
   const [threadId, setThreadId] = useState<string | null>(null);
 
@@ -210,7 +219,12 @@ export default function ChatApp({
     // Debug sanity: access vs id token
     const a = decodeJwtPayload(accessToken);
     const i = decodeJwtPayload(idToken);
-    console.log("token_use(accessToken):", a?.token_use, "len", accessToken?.length);
+    console.log(
+      "token_use(accessToken):",
+      a?.token_use,
+      "len",
+      accessToken?.length
+    );
     console.log("token_use(idToken):", i?.token_use, "len", idToken?.length);
   }, [accessToken, idToken]);
 
@@ -300,17 +314,24 @@ export default function ChatApp({
 
   function appendAssistantPlaceholder() {
     const assistantId = `m_${safeUUID()}`;
-    setHistory((h) => [...h, { id: assistantId, ts: Date.now(), role: "assistant", text: "" }]);
+    setHistory((h) => [
+      ...h,
+      { id: assistantId, ts: Date.now(), role: "assistant", text: "" },
+    ]);
     return assistantId;
   }
 
   function updateAssistantText(assistantId: string, text: string) {
-    setHistory((h) => h.map((m) => (m.id === assistantId ? { ...m, text } : m)));
+    setHistory((h) =>
+      h.map((m) => (m.id === assistantId ? { ...m, text } : m))
+    );
   }
 
   function replaceAssistantWithError(assistantId: string, message: string) {
     setHistory((h) =>
-      h.map((m) => (m.id === assistantId ? { ...m, text: `⚠️ ${message}` } : m))
+      h.map((m) =>
+        m.id === assistantId ? { ...m, text: `⚠️ ${message}` } : m
+      )
     );
   }
 
@@ -438,7 +459,9 @@ export default function ChatApp({
             id: `m_${safeUUID()}`,
             ts: Date.now(),
             role: "assistant",
-            text: `⚠️ streaming failed, falling back to non-stream.\n${e?.message ?? String(e)}`,
+            text: `⚠️ streaming failed, falling back to non-stream.\n${
+              e?.message ?? String(e)
+            }`,
           },
         ]);
       }
@@ -634,11 +657,74 @@ export default function ChatApp({
                       borderRadius: 12,
                       border: "1px solid #333",
                       background: m.role === "user" ? "#111" : "transparent",
-                      whiteSpace: "pre-wrap",
                       lineHeight: 1.35,
+                      whiteSpace: "normal",
+                      overflowWrap: "anywhere",
                     }}
                   >
-                    {m.text}
+                    {m.role === "assistant" ? (
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        rehypePlugins={[rehypeHighlight]}
+                        components={{
+                          code({ inline, className, children, ...props }) {
+                            if (inline) {
+                              return (
+                                <code
+                                  style={{
+                                    background: "#111",
+                                    border: "1px solid #333",
+                                    padding: "2px 6px",
+                                    borderRadius: 8,
+                                    fontFamily:
+                                      "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                                    fontSize: 13,
+                                  }}
+                                  {...props}
+                                >
+                                  {children}
+                                </code>
+                              );
+                            }
+                            return (
+                              <pre
+                                style={{
+                                  background: "#0f0f0f",
+                                  border: "1px solid #333",
+                                  borderRadius: 12,
+                                  padding: 12,
+                                  overflowX: "auto",
+                                  marginTop: 8,
+                                  marginBottom: 8,
+                                }}
+                              >
+                                <code className={className} {...props}>
+                                  {children}
+                                </code>
+                              </pre>
+                            );
+                          },
+                          p({ children }) {
+                            return (
+                              <p style={{ margin: "6px 0", whiteSpace: "pre-wrap" }}>
+                                {children}
+                              </p>
+                            );
+                          },
+                          li({ children }) {
+                            return (
+                              <li style={{ whiteSpace: "pre-wrap" }}>
+                                {children}
+                              </li>
+                            );
+                          },
+                        }}
+                      >
+                        {m.text}
+                      </ReactMarkdown>
+                    ) : (
+                      <div style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
+                    )}
                   </div>
                 </div>
               ))

@@ -13,10 +13,14 @@
     "@assistant-ui/react": "^0.12.10",
     "@assistant-ui/react-markdown": "^0.12.3",
     "@assistant-ui/react-ui": "^0.2.1",
+    "highlight.js": "^11.11.1",
     "oidc-client-ts": "^3.4.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "react-oidc-context": "^3.3.0"
+    "react-markdown": "^10.1.0",
+    "react-oidc-context": "^3.3.0",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
