@@ -1,10 +1,13 @@
 // src/ChatApp.tsx
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import "highlight.js/styles/github-dark.css";
 
+/* =========================
+   Types
+========================= */
 type ThreadMeta = {
   threadId: string;
   title: string;
@@ -32,10 +35,17 @@ type ThreadGetResponse = {
   messages: BackendMsg[];
 };
 
+/* =========================
+   Small utilities
+========================= */
 function safeUUID(): string {
   return typeof globalThis.crypto?.randomUUID === "function"
     ? globalThis.crypto.randomUUID()
     : `c_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function isAbortError(e: any) {
+  return e?.name === "AbortError";
 }
 
 async function fetchJson(url: string, init: RequestInit): Promise<any> {
@@ -56,10 +66,284 @@ async function fetchJson(url: string, init: RequestInit): Promise<any> {
   return data;
 }
 
-function isAbortError(e: any) {
-  return e?.name === "AbortError";
+/* =========================
+   Clipboard hook
+========================= */
+function useClipboardToast(timeoutMs = 1200) {
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const copyToClipboard = useCallback(
+    (text: string, key: string) => {
+      const s = String(text ?? "");
+      if (!s) return;
+
+      const fallback = () => {
+        const ta = document.createElement("textarea");
+        ta.value = s;
+        ta.setAttribute("readonly", "true");
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        ta.style.top = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      };
+
+      (async () => {
+        try {
+          if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(s);
+          else fallback();
+          setCopiedKey(key);
+          window.setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), timeoutMs);
+        } catch {
+          try {
+            fallback();
+            setCopiedKey(key);
+            window.setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), timeoutMs);
+          } catch {
+            // ignore
+          }
+        }
+      })();
+    },
+    [timeoutMs]
+  );
+
+  return { copiedKey, copyToClipboard };
 }
 
+/* =========================
+   API client wrapper
+========================= */
+function makeApi({
+  apiBase,
+  streamApiBase,
+  headersAccess,
+  headersId,
+}: {
+  apiBase?: string;
+  streamApiBase?: string;
+  headersAccess: Record<string, string>;
+  headersId: Record<string, string>;
+}) {
+  return {
+    async listThreads(limit = 20): Promise<ThreadsListResponse> {
+      if (!apiBase) throw new Error("Missing VITE_API_BASE");
+      return fetchJson(`${apiBase}/threads?limit=${limit}`, {
+        method: "GET",
+        headers: headersAccess,
+      });
+    },
+
+    async createThread(title = "Untitled"): Promise<{ threadId: string }> {
+      if (!apiBase) throw new Error("Missing VITE_API_BASE");
+      return fetchJson(`${apiBase}/threads`, {
+        method: "POST",
+        headers: { ...headersAccess, "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+    },
+
+    async getThread(tid: string): Promise<ThreadGetResponse> {
+      if (!apiBase) throw new Error("Missing VITE_API_BASE");
+      return fetchJson(`${apiBase}/threads/${tid}`, {
+        method: "GET",
+        headers: headersAccess,
+      });
+    },
+
+    async chatNonStream(args: {
+      threadId: string;
+      text: string;
+      clientMsgId: string;
+      web: boolean;
+      signal: AbortSignal;
+    }): Promise<{ text?: string }> {
+      if (!apiBase) throw new Error("Missing VITE_API_BASE");
+      return fetchJson(`${apiBase}/chat`, {
+        method: "POST",
+        signal: args.signal,
+        headers: { ...headersAccess, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          threadId: args.threadId,
+          text: args.text,
+          clientMsgId: args.clientMsgId,
+          web: args.web,
+        }),
+      });
+    },
+
+    async chatStreamFetch(args: {
+      threadId: string;
+      text: string;
+      clientMsgId: string;
+      web: boolean;
+      signal: AbortSignal;
+    }): Promise<Response> {
+      if (!streamApiBase) throw new Error("Missing VITE_STREAM_API_BASE");
+      return fetch(`${streamApiBase}/chat`, {
+        method: "POST",
+        signal: args.signal,
+        headers: {
+          ...headersId,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          threadId: args.threadId,
+          text: args.text,
+          clientMsgId: args.clientMsgId,
+          web: args.web,
+        }),
+      });
+    },
+  };
+}
+
+/* =========================
+   Streaming timer helper
+========================= */
+function createStreamTimers() {
+  let firstByteTimer: number | null = null;
+  let progressTimer: number | null = null;
+
+  const clear = () => {
+    if (firstByteTimer) window.clearTimeout(firstByteTimer);
+    if (progressTimer) window.clearTimeout(progressTimer);
+    firstByteTimer = null;
+    progressTimer = null;
+  };
+
+  const armFirstByte = (ms: number, onTimeout: () => void) => {
+    if (firstByteTimer) window.clearTimeout(firstByteTimer);
+    firstByteTimer = window.setTimeout(onTimeout, ms);
+  };
+
+  const armProgress = (ms: number, onTimeout: () => void) => {
+    if (progressTimer) window.clearTimeout(progressTimer);
+    progressTimer = window.setTimeout(onTimeout, ms);
+  };
+
+  return { clear, armFirstByte, armProgress };
+}
+
+/* =========================
+   Markdown renderer component
+========================= */
+function AssistantMarkdown({
+  text,
+  msgId,
+  copiedKey,
+  copyToClipboard,
+}: {
+  text: string;
+  msgId: string;
+  copiedKey: string | null;
+  copyToClipboard: (text: string, key: string) => void;
+}) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeHighlight]}
+      components={{
+        pre({ children }) {
+          const codeNode: any = Array.isArray(children) ? children[0] : children;
+
+          const raw =
+            typeof codeNode?.props?.children === "string"
+              ? codeNode.props.children
+              : Array.isArray(codeNode?.props?.children)
+              ? codeNode.props.children.join("")
+              : "";
+
+          const codeText = String(raw ?? "").replace(/\n$/, "");
+          const key = `${msgId}:pre:${codeText.length}`;
+
+          return (
+            <div style={{ position: "relative", margin: "8px 0" }}>
+              <button
+                type="button"
+                onClick={() => codeText && copyToClipboard(codeText, key)}
+                style={{
+                  position: "absolute",
+                  top: 8,
+                  right: 8,
+                  padding: "6px 10px",
+                  borderRadius: 10,
+                  border: "1px solid #333",
+                  background: "rgba(17,17,17,0.9)",
+                  color: "white",
+                  fontSize: 12,
+                  cursor: codeText ? "pointer" : "not-allowed",
+                  opacity: codeText ? 1 : 0.6,
+                }}
+                title="Copy code"
+                disabled={!codeText}
+              >
+                {copiedKey === key ? "Copied ✓" : "Copy"}
+              </button>
+
+              <pre
+                style={{
+                  background: "#0f0f0f",
+                  border: "1px solid #333",
+                  borderRadius: 12,
+                  padding: 12,
+                  paddingTop: 40,
+                  overflowX: "auto",
+                  margin: 0,
+                }}
+              >
+                {children}
+              </pre>
+            </div>
+          );
+        },
+
+        code({ className, children, ...props }) {
+          const isInline = !className;
+          if (!isInline) {
+            return (
+              <code className={className} {...props}>
+                {children}
+              </code>
+            );
+          }
+
+          return (
+            <code
+              style={{
+                background: "#111",
+                border: "1px solid #333",
+                padding: "2px 6px",
+                borderRadius: 8,
+                fontFamily:
+                  "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                fontSize: 13,
+              }}
+              {...props}
+            >
+              {children}
+            </code>
+          );
+        },
+
+        p({ children }) {
+          return <div style={{ margin: "6px 0", whiteSpace: "pre-wrap" }}>{children}</div>;
+        },
+        li({ children }) {
+          return <li style={{ whiteSpace: "pre-wrap" }}>{children}</li>;
+        },
+      }}
+    >
+      {text}
+    </ReactMarkdown>
+  );
+}
+
+/* =========================
+   Composer component (unchanged API)
+========================= */
 function Composer({
   disabled,
   onSend,
@@ -180,15 +464,34 @@ function Composer({
   );
 }
 
-export default function ChatApp({
+/* =========================
+   Main hook: chat runtime
+========================= */
+function useChatRuntime({
+  apiBase,
+  streamApiBase,
   accessToken,
   idToken,
+  streamEnabled,
+  webEnabled,
 }: {
+  apiBase?: string;
+  streamApiBase?: string;
   accessToken: string;
   idToken: string;
+  streamEnabled: boolean;
+  webEnabled: boolean;
 }) {
-  const API_BASE = import.meta.env.VITE_API_BASE as string | undefined;
-  const STREAM_API_BASE = import.meta.env.VITE_STREAM_API_BASE as string | undefined;
+  const headersAccess = useMemo(
+    () => ({ Authorization: `Bearer ${accessToken}` }),
+    [accessToken]
+  );
+  const headersId = useMemo(() => ({ Authorization: `Bearer ${idToken}` }), [idToken]);
+
+  const api = useMemo(
+    () => makeApi({ apiBase, streamApiBase, headersAccess, headersId }),
+    [apiBase, streamApiBase, headersAccess, headersId]
+  );
 
   const [threadId, setThreadId] = useState<string | null>(null);
 
@@ -200,138 +503,71 @@ export default function ChatApp({
   const [hydrating, setHydrating] = useState(false);
   const [hydrateError, setHydrateError] = useState<string | null>(null);
 
-  const [streamEnabled, setStreamEnabled] = useState(true);
-  const [webEnabled, setWebEnabled] = useState(true);
-
-  // copied toast
-  const [copiedKey, setCopiedKey] = useState<string | null>(null);
-
-  function copyToClipboard(text: string, key: string) {
-    const s = String(text ?? "");
-    if (!s) return;
-
-    const fallback = () => {
-      const ta = document.createElement("textarea");
-      ta.value = s;
-      ta.setAttribute("readonly", "true");
-      ta.style.position = "fixed";
-      ta.style.left = "-9999px";
-      ta.style.top = "-9999px";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-    };
-
-    (async () => {
-      try {
-        if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(s);
-        else fallback();
-        setCopiedKey(key);
-        window.setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 1200);
-      } catch {
-        try {
-          fallback();
-          setCopiedKey(key);
-          window.setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 1200);
-        } catch {
-          // ignore
-        }
-      }
-    })();
-  }
-
-  // Always points to the currently visible thread.
+  // Always points to currently visible thread
   const activeThreadRef = useRef<string | null>(null);
 
-  // One in-flight request at a time (especially important for streaming).
+  // One in-flight request at a time
   const inFlightAbortRef = useRef<AbortController | null>(null);
 
-  // autoscroll
-  const bottomRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [history, threadId]);
-
-  const headersAccess = useMemo(
-    () => ({ Authorization: `Bearer ${accessToken}` }),
-    [accessToken]
-  );
-
-  const headersId = useMemo(
-    () => ({ Authorization: `Bearer ${idToken}` }),
-    [idToken]
-  );
-
-  function abortInFlight() {
+  const abortInFlight = useCallback(() => {
     try {
       inFlightAbortRef.current?.abort();
     } catch {}
     inFlightAbortRef.current = null;
-  }
+  }, []);
 
   useEffect(() => {
     return () => abortInFlight();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [abortInFlight]);
 
-  async function refreshThreads() {
-    if (!API_BASE) return [];
-    const data = (await fetchJson(`${API_BASE}/threads?limit=20`, {
-      method: "GET",
-      headers: headersAccess,
-    })) as ThreadsListResponse;
-
+  const refreshThreads = useCallback(async () => {
+    if (!apiBase) return [];
+    const data = await api.listThreads(20);
     const items = Array.isArray(data?.items) ? data.items : [];
     setThreads(items);
     return items;
-  }
+  }, [api, apiBase]);
 
-  async function createNewThread() {
-    if (!API_BASE) return;
+  const createNewThread = useCallback(async () => {
+    if (!apiBase) return;
     setThreadsError(null);
 
-    const out = await fetchJson(`${API_BASE}/threads`, {
-      method: "POST",
-      headers: { ...headersAccess, "Content-Type": "application/json" },
-      body: JSON.stringify({ title: "Untitled" }),
-    });
-
+    const out = await api.createThread("Untitled");
     const tid = String(out?.threadId ?? "");
     if (tid) {
       abortInFlight();
       setThreadId(tid);
       await refreshThreads();
     }
-  }
+  }, [api, apiBase, abortInFlight, refreshThreads]);
 
-  async function hydrateThread(tid: string) {
-    if (!API_BASE) return;
+  const hydrateThread = useCallback(
+    async (tid: string) => {
+      if (!apiBase) return;
 
-    abortInFlight();
-    activeThreadRef.current = tid;
+      abortInFlight();
+      activeThreadRef.current = tid;
 
-    try {
-      setHydrating(true);
-      setHydrateError(null);
+      try {
+        setHydrating(true);
+        setHydrateError(null);
 
-      const thread = (await fetchJson(`${API_BASE}/threads/${tid}`, {
-        method: "GET",
-        headers: headersAccess,
-      })) as ThreadGetResponse;
+        const thread = await api.getThread(tid);
+        if (activeThreadRef.current !== tid) return;
 
-      if (activeThreadRef.current !== tid) return;
-      setHistory(Array.isArray(thread?.messages) ? thread.messages : []);
-    } catch (e: any) {
-      if (activeThreadRef.current !== tid) return;
-      setHydrateError(e?.message ?? String(e));
-      setHistory([]);
-    } finally {
-      if (activeThreadRef.current === tid) setHydrating(false);
-    }
-  }
+        setHistory(Array.isArray(thread?.messages) ? thread.messages : []);
+      } catch (e: any) {
+        if (activeThreadRef.current !== tid) return;
+        setHydrateError(e?.message ?? String(e));
+        setHistory([]);
+      } finally {
+        if (activeThreadRef.current === tid) setHydrating(false);
+      }
+    },
+    [api, apiBase, abortInFlight]
+  );
 
-  function appendOptimisticUser(text: string) {
+  const appendOptimisticUser = useCallback((text: string) => {
     const clientMsgId = safeUUID();
     const userMsg: BackendMsg = {
       id: `m_${clientMsgId}`,
@@ -342,203 +578,189 @@ export default function ChatApp({
     };
     setHistory((h) => [...h, userMsg]);
     return { clientMsgId };
-  }
+  }, []);
 
-  function appendAssistantPlaceholder(initial = "Thinking…") {
+  const appendAssistantPlaceholder = useCallback((initial = "Thinking…") => {
     const assistantId = `m_${safeUUID()}`;
-    setHistory((h) => [
-      ...h,
-      { id: assistantId, ts: Date.now(), role: "assistant", text: initial },
-    ]);
+    setHistory((h) => [...h, { id: assistantId, ts: Date.now(), role: "assistant", text: initial }]);
     return assistantId;
-  }
+  }, []);
 
-  function updateAssistantText(assistantId: string, text: string) {
+  const updateAssistantText = useCallback((assistantId: string, text: string) => {
     setHistory((h) => h.map((m) => (m.id === assistantId ? { ...m, text } : m)));
-  }
+  }, []);
 
-  function replaceAssistantWithError(assistantId: string, message: string) {
-    updateAssistantText(assistantId, `⚠️ ${message}`);
-  }
+  const replaceAssistantWithError = useCallback(
+    (assistantId: string, message: string) => {
+      updateAssistantText(assistantId, `⚠️ ${message}`);
+    },
+    [updateAssistantText]
+  );
 
-  async function sendMessageNonStream(text: string, tid: string) {
-    if (!API_BASE) throw new Error("Missing VITE_API_BASE");
+  const sendMessageNonStream = useCallback(
+    async (text: string, tid: string) => {
+      abortInFlight();
+      const { clientMsgId } = appendOptimisticUser(text);
+      const assistantId = appendAssistantPlaceholder("Thinking…");
 
-    abortInFlight();
-    const { clientMsgId } = appendOptimisticUser(text);
-    const assistantId = appendAssistantPlaceholder("Thinking…");
+      const controller = new AbortController();
+      inFlightAbortRef.current = controller;
 
-    const controller = new AbortController();
-    inFlightAbortRef.current = controller;
-
-    try {
-      const data = await fetchJson(`${API_BASE}/chat`, {
-        method: "POST",
-        signal: controller.signal,
-        headers: { ...headersAccess, "Content-Type": "application/json" },
-        body: JSON.stringify({ threadId: tid, text, clientMsgId, web: webEnabled }),
-      });
-
-      if (activeThreadRef.current !== tid) return;
-
-      const assistantText = String(data?.text ?? "");
-      updateAssistantText(assistantId, assistantText || "(empty response)");
-      refreshThreads().catch(() => {});
-    } catch (e: any) {
-      if (isAbortError(e) || activeThreadRef.current !== tid) return;
-      replaceAssistantWithError(assistantId, e?.message ?? String(e));
-      throw e;
-    } finally {
-      if (inFlightAbortRef.current === controller) inFlightAbortRef.current = null;
-    }
-  }
-
-  /**
-   * Streaming: assumes the backend streams raw text chunks.
-   * Adds:
-   *  - first-byte timeout (8s)
-   *  - no-progress timeout (25s)
-   *  - clean fallback behavior
-   */
-  async function sendMessageStream(text: string, tid: string) {
-    if (!STREAM_API_BASE) throw new Error("Missing VITE_STREAM_API_BASE");
-
-    abortInFlight();
-    const { clientMsgId } = appendOptimisticUser(text);
-    const assistantId = appendAssistantPlaceholder("Thinking…");
-
-    const controller = new AbortController();
-    inFlightAbortRef.current = controller;
-
-    // timers
-    let firstByteTimer: number | null = null;
-    let progressTimer: number | null = null;
-
-    const clearTimers = () => {
-      if (firstByteTimer) window.clearTimeout(firstByteTimer);
-      if (progressTimer) window.clearTimeout(progressTimer);
-      firstByteTimer = null;
-      progressTimer = null;
-    };
-
-    const armProgressTimeout = () => {
-      if (progressTimer) window.clearTimeout(progressTimer);
-      progressTimer = window.setTimeout(() => {
-        try {
-          controller.abort();
-        } catch {}
-      }, 25_000);
-    };
-
-    try {
-      const r = await fetch(`${STREAM_API_BASE}/chat`, {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          ...headersId, // stream authorizer expects ID token (your note)
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ threadId: tid, text, clientMsgId, web: webEnabled }),
-      });
-
-      if (!r.ok || !r.body) {
-        const raw = await r.text().catch(() => "");
-        throw new Error(`HTTP ${r.status}: ${raw || r.statusText}`);
-      }
-
-      const reader = r.body.getReader();
-      const decoder = new TextDecoder();
-
-      let acc = "";
-      let gotAnyByte = false;
-
-      // If nothing arrives soon, abort -> fallback
-      firstByteTimer = window.setTimeout(() => {
-        try {
-          controller.abort();
-        } catch {}
-      }, 8_000);
-
-      armProgressTimeout();
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-
-        if (activeThreadRef.current !== tid) {
-          try {
-            await reader.cancel();
-          } catch {}
-          clearTimers();
-          return;
-        }
-
-        if (value && value.length) {
-          gotAnyByte = true;
-          if (firstByteTimer) {
-            window.clearTimeout(firstByteTimer);
-            firstByteTimer = null;
-          }
-          armProgressTimeout();
-        }
-
-        const chunk = decoder.decode(value, { stream: true });
-        acc += chunk;
-
-        // show something even if backend sends whitespace/newlines
-        updateAssistantText(assistantId, acc || "Thinking…");
-      }
-
-      clearTimers();
-
-      if (activeThreadRef.current !== tid) return;
-
-      // stream ended but sent nothing
-      if (!gotAnyByte && !acc.trim()) {
-        updateAssistantText(assistantId, "⚠️ stream ended with no content");
-      }
-
-      refreshThreads().catch(() => {});
-    } catch (e: any) {
-      clearTimers();
-      if (isAbortError(e) || activeThreadRef.current !== tid) return;
-      replaceAssistantWithError(assistantId, `streaming failed: ${e?.message ?? String(e)}`);
-      throw e;
-    } finally {
-      clearTimers();
-      if (inFlightAbortRef.current === controller) inFlightAbortRef.current = null;
-    }
-  }
-
-  async function onSend(text: string) {
-    if (!threadId) throw new Error("No thread selected");
-    const tid = threadId;
-    activeThreadRef.current = tid;
-
-    if (streamEnabled && STREAM_API_BASE) {
       try {
-        await sendMessageStream(text, tid);
-        return;
-      } catch (e: any) {
+        const data = await api.chatNonStream({
+          threadId: tid,
+          text,
+          clientMsgId,
+          web: webEnabled,
+          signal: controller.signal,
+        });
+
         if (activeThreadRef.current !== tid) return;
-        setHistory((h) => [
-          ...h,
-          {
-            id: `m_${safeUUID()}`,
-            ts: Date.now(),
-            role: "assistant",
-            text: `⚠️ streaming failed, falling back to non-stream.\n${e?.message ?? String(e)}`,
-          },
-        ]);
+
+        const assistantText = String(data?.text ?? "");
+        updateAssistantText(assistantId, assistantText || "(empty response)");
+        refreshThreads().catch(() => {});
+      } catch (e: any) {
+        if (isAbortError(e) || activeThreadRef.current !== tid) return;
+        replaceAssistantWithError(assistantId, e?.message ?? String(e));
+        throw e;
+      } finally {
+        if (inFlightAbortRef.current === controller) inFlightAbortRef.current = null;
       }
-    }
+    },
+    [
+      api,
+      webEnabled,
+      abortInFlight,
+      appendOptimisticUser,
+      appendAssistantPlaceholder,
+      updateAssistantText,
+      replaceAssistantWithError,
+      refreshThreads,
+    ]
+  );
 
-    await sendMessageNonStream(text, tid);
-  }
+  const sendMessageStream = useCallback(
+    async (text: string, tid: string) => {
+      abortInFlight();
+      const { clientMsgId } = appendOptimisticUser(text);
+      const assistantId = appendAssistantPlaceholder("Thinking…");
 
-  // initial load: threads, pick newest
+      const controller = new AbortController();
+      inFlightAbortRef.current = controller;
+
+      const timers = createStreamTimers();
+      const abort = () => {
+        try {
+          controller.abort();
+        } catch {}
+      };
+
+      try {
+        const r = await api.chatStreamFetch({
+          threadId: tid,
+          text,
+          clientMsgId,
+          web: webEnabled,
+          signal: controller.signal,
+        });
+
+        if (!r.ok || !r.body) {
+          const raw = await r.text().catch(() => "");
+          throw new Error(`HTTP ${r.status}: ${raw || r.statusText}`);
+        }
+
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+
+        let acc = "";
+        let gotAnyByte = false;
+
+        timers.armFirstByte(8_000, abort);
+        timers.armProgress(25_000, abort);
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          if (activeThreadRef.current !== tid) {
+            try {
+              await reader.cancel();
+            } catch {}
+            timers.clear();
+            return;
+          }
+
+          if (value && value.length) {
+            gotAnyByte = true;
+            timers.armProgress(25_000, abort);
+          }
+
+          const chunk = decoder.decode(value, { stream: true });
+          acc += chunk;
+          updateAssistantText(assistantId, acc || "Thinking…");
+        }
+
+        timers.clear();
+
+        if (activeThreadRef.current !== tid) return;
+        if (!gotAnyByte && !acc.trim()) updateAssistantText(assistantId, "⚠️ stream ended with no content");
+
+        refreshThreads().catch(() => {});
+      } catch (e: any) {
+        timers.clear();
+        if (isAbortError(e) || activeThreadRef.current !== tid) return;
+        replaceAssistantWithError(assistantId, `streaming failed: ${e?.message ?? String(e)}`);
+        throw e;
+      } finally {
+        timers.clear();
+        if (inFlightAbortRef.current === controller) inFlightAbortRef.current = null;
+      }
+    },
+    [
+      api,
+      webEnabled,
+      abortInFlight,
+      appendOptimisticUser,
+      appendAssistantPlaceholder,
+      updateAssistantText,
+      replaceAssistantWithError,
+      refreshThreads,
+    ]
+  );
+
+  const onSend = useCallback(
+    async (text: string) => {
+      if (!threadId) throw new Error("No thread selected");
+      const tid = threadId;
+      activeThreadRef.current = tid;
+
+      if (streamEnabled && streamApiBase) {
+        try {
+          await sendMessageStream(text, tid);
+          return;
+        } catch (e: any) {
+          if (activeThreadRef.current !== tid) return;
+          setHistory((h) => [
+            ...h,
+            {
+              id: `m_${safeUUID()}`,
+              ts: Date.now(),
+              role: "assistant",
+              text: `⚠️ streaming failed, falling back to non-stream.\n${e?.message ?? String(e)}`,
+            },
+          ]);
+        }
+      }
+
+      await sendMessageNonStream(text, tid);
+    },
+    [threadId, streamEnabled, streamApiBase, sendMessageStream, sendMessageNonStream]
+  );
+
+  // initial load
   useEffect(() => {
-    if (!API_BASE || !accessToken) return;
+    if (!apiBase || !accessToken) return;
     let alive = true;
 
     (async () => {
@@ -566,14 +788,76 @@ export default function ChatApp({
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [API_BASE, accessToken]);
+  }, [apiBase, accessToken]);
 
-  // hydrate whenever thread changes
+  // hydrate on thread change
   useEffect(() => {
     if (!threadId) return;
     hydrateThread(threadId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [threadId]);
+  }, [threadId, hydrateThread]);
+
+  return {
+    threadId,
+    setThreadId,
+    threads,
+    loadingThreads,
+    threadsError,
+    refreshThreads,
+    createNewThread,
+    history,
+    setHistory,
+    hydrating,
+    hydrateError,
+    abortInFlight,
+    onSend,
+  };
+}
+
+/* =========================
+   Main component
+========================= */
+export default function ChatApp({
+  accessToken,
+  idToken,
+}: {
+  accessToken: string;
+  idToken: string;
+}) {
+  const API_BASE = import.meta.env.VITE_API_BASE as string | undefined;
+  const STREAM_API_BASE = import.meta.env.VITE_STREAM_API_BASE as string | undefined;
+
+  const [streamEnabled, setStreamEnabled] = useState(true);
+  const [webEnabled, setWebEnabled] = useState(true);
+
+  const { copiedKey, copyToClipboard } = useClipboardToast(1200);
+
+  const {
+    threadId,
+    setThreadId,
+    threads,
+    loadingThreads,
+    threadsError,
+    refreshThreads,
+    createNewThread,
+    history,
+    hydrating,
+    hydrateError,
+    abortInFlight,
+    onSend,
+  } = useChatRuntime({
+    apiBase: API_BASE,
+    streamApiBase: STREAM_API_BASE,
+    accessToken,
+    idToken,
+    streamEnabled,
+    webEnabled,
+  });
+
+  // autoscroll
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [history, threadId]);
 
   return (
     <div
@@ -632,9 +916,7 @@ export default function ChatApp({
         </div>
 
         {threadsError && (
-          <div style={{ color: "#ff7b7b", whiteSpace: "pre-wrap" }}>
-            {threadsError}
-          </div>
+          <div style={{ color: "#ff7b7b", whiteSpace: "pre-wrap" }}>{threadsError}</div>
         )}
 
         {threads.map((t) => (
@@ -669,19 +951,11 @@ export default function ChatApp({
         <div style={{ padding: 10, borderBottom: "1px solid #222" }}>
           <div style={{ fontSize: 12, opacity: 0.8 }}>
             Active thread:{" "}
-            <span style={{ fontFamily: "monospace" }}>
-              {threadId ?? "(none yet)"}
-            </span>
-            {hydrating && (
-              <span style={{ marginLeft: 12 }}>(loading history…)</span>
-            )}
+            <span style={{ fontFamily: "monospace" }}>{threadId ?? "(none yet)"}</span>
+            {hydrating && <span style={{ marginLeft: 12 }}>(loading history…)</span>}
           </div>
 
-          {hydrateError && (
-            <div style={{ color: "#ff7b7b", fontSize: 12 }}>
-              {hydrateError}
-            </div>
-          )}
+          {hydrateError && <div style={{ color: "#ff7b7b", fontSize: 12 }}>{hydrateError}</div>}
 
           {!API_BASE && (
             <div style={{ color: "#ff7b7b", fontSize: 12 }}>
@@ -727,112 +1001,12 @@ export default function ChatApp({
                     }}
                   >
                     {m.role === "assistant" ? (
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        rehypePlugins={[rehypeHighlight]}
-                        components={{
-                          // ✅ FIX: Put copy button on <pre>, not in code() (prevents nested <pre>)
-                          pre({ children }) {
-                            // children usually: <code className=...>...</code>
-                            const codeNode: any = Array.isArray(children)
-                              ? children[0]
-                              : children;
-
-                            const raw =
-                              typeof codeNode?.props?.children === "string"
-                                ? codeNode.props.children
-                                : Array.isArray(codeNode?.props?.children)
-                                ? codeNode.props.children.join("")
-                                : "";
-
-                            const codeText = String(raw ?? "").replace(/\n$/, "");
-                            const key = `${m.id}:pre:${codeText.length}`;
-
-                            return (
-                              <div style={{ position: "relative", margin: "8px 0" }}>
-                                <button
-                                  type="button"
-                                  onClick={() => codeText && copyToClipboard(codeText, key)}
-                                  style={{
-                                    position: "absolute",
-                                    top: 8,
-                                    right: 8,
-                                    padding: "6px 10px",
-                                    borderRadius: 10,
-                                    border: "1px solid #333",
-                                    background: "rgba(17,17,17,0.9)",
-                                    color: "white",
-                                    fontSize: 12,
-                                    cursor: codeText ? "pointer" : "not-allowed",
-                                    opacity: codeText ? 1 : 0.6,
-                                  }}
-                                  title="Copy code"
-                                  disabled={!codeText}
-                                >
-                                  {copiedKey === key ? "Copied ✓" : "Copy"}
-                                </button>
-
-                                <pre
-                                  style={{
-                                    background: "#0f0f0f",
-                                    border: "1px solid #333",
-                                    borderRadius: 12,
-                                    padding: 12,
-                                    paddingTop: 40,
-                                    overflowX: "auto",
-                                    margin: 0,
-                                  }}
-                                >
-                                  {children}
-                                </pre>
-                              </div>
-                            );
-                          },
-
-                          // Inline code styling only; block code stays inside <pre>
-                          code({ className, children, ...props }) {
-                            const isInline = !className; // heuristic: block code gets className like "language-ts"
-                            if (!isInline) {
-                              return (
-                                <code className={className} {...props}>
-                                  {children}
-                                </code>
-                              );
-                            }
-
-                            return (
-                              <code
-                                style={{
-                                  background: "#111",
-                                  border: "1px solid #333",
-                                  padding: "2px 6px",
-                                  borderRadius: 8,
-                                  fontFamily:
-                                    "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                                  fontSize: 13,
-                                }}
-                                {...props}
-                              >
-                                {children}
-                              </code>
-                            );
-                          },
-
-                          // ✅ Avoid <p> wrapping block-level things; use div for paragraphs
-                          p({ children }) {
-                            return (
-                              <div style={{ margin: "6px 0", whiteSpace: "pre-wrap" }}>
-                                {children}
-                              </div>
-                            );
-                          },
-                          li({ children }) {
-                            return <li style={{ whiteSpace: "pre-wrap" }}>{children}</li>;
-                          },
-                        }}
-                      >
-                        {m.text}
-                      </ReactMarkdown>
+                      <AssistantMarkdown
+                        text={m.text}
+                        msgId={m.id}
+                        copiedKey={copiedKey}
+                        copyToClipboard={copyToClipboard}
+                      />
                     ) : (
                       <div style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
                     )}
