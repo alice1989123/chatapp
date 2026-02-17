@@ -193,6 +193,53 @@ export default function ChatApp({
 
   const [streamEnabled, setStreamEnabled] = useState(true);
 
+  // --- NEW: small "copied" toast per code-block key
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  function copyToClipboard(text: string, key: string) {
+    const s = String(text ?? "");
+    if (!s) return;
+
+    // navigator.clipboard is secure-context only; fallback to execCommand.
+    const tryModern = async () => {
+      await navigator.clipboard.writeText(s);
+    };
+
+    const fallback = () => {
+      const ta = document.createElement("textarea");
+      ta.value = s;
+      ta.setAttribute("readonly", "true");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      ta.style.top = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    };
+
+    (async () => {
+      try {
+        if (navigator.clipboard?.writeText) await tryModern();
+        else fallback();
+        setCopiedKey(key);
+        window.setTimeout(() => {
+          setCopiedKey((k) => (k === key ? null : k));
+        }, 1200);
+      } catch {
+        try {
+          fallback();
+          setCopiedKey(key);
+          window.setTimeout(() => {
+            setCopiedKey((k) => (k === key ? null : k));
+          }, 1200);
+        } catch {
+          // ignore
+        }
+      }
+    })();
+  }
+
   // Always points to the *currently visible* thread.
   const activeThreadRef = useRef<string | null>(null);
 
@@ -667,7 +714,12 @@ export default function ChatApp({
                         remarkPlugins={[remarkGfm]}
                         rehypePlugins={[rehypeHighlight]}
                         components={{
-                          code({ inline, className, children, ...props }) {
+                          code: ({ inline, className, children, ...props }) => {
+                            const codeText = String(children ?? "").replace(
+                              /\n$/,
+                              ""
+                            );
+
                             if (inline) {
                               return (
                                 <code
@@ -686,22 +738,47 @@ export default function ChatApp({
                                 </code>
                               );
                             }
+
+                            const key = `${m.id}:${className || "code"}:${codeText.length}`;
+
                             return (
-                              <pre
-                                style={{
-                                  background: "#0f0f0f",
-                                  border: "1px solid #333",
-                                  borderRadius: 12,
-                                  padding: 12,
-                                  overflowX: "auto",
-                                  marginTop: 8,
-                                  marginBottom: 8,
-                                }}
-                              >
-                                <code className={className} {...props}>
-                                  {children}
-                                </code>
-                              </pre>
+                              <div style={{ position: "relative", marginTop: 8, marginBottom: 8 }}>
+                                <button
+                                  type="button"
+                                  onClick={() => copyToClipboard(codeText, key)}
+                                  style={{
+                                    position: "absolute",
+                                    top: 8,
+                                    right: 8,
+                                    padding: "6px 10px",
+                                    borderRadius: 10,
+                                    border: "1px solid #333",
+                                    background: "rgba(17,17,17,0.9)",
+                                    color: "white",
+                                    fontSize: 12,
+                                    cursor: "pointer",
+                                  }}
+                                  title="Copy code"
+                                >
+                                  {copiedKey === key ? "Copied ✓" : "Copy"}
+                                </button>
+
+                                <pre
+                                  style={{
+                                    background: "#0f0f0f",
+                                    border: "1px solid #333",
+                                    borderRadius: 12,
+                                    padding: 12,
+                                    paddingTop: 40, // leave room for button
+                                    overflowX: "auto",
+                                    margin: 0,
+                                  }}
+                                >
+                                  <code className={className} {...props}>
+                                    {children}
+                                  </code>
+                                </pre>
+                              </div>
                             );
                           },
                           p({ children }) {
@@ -712,11 +789,7 @@ export default function ChatApp({
                             );
                           },
                           li({ children }) {
-                            return (
-                              <li style={{ whiteSpace: "pre-wrap" }}>
-                                {children}
-                              </li>
-                            );
+                            return <li style={{ whiteSpace: "pre-wrap" }}>{children}</li>;
                           },
                         }}
                       >
