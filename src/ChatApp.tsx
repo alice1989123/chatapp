@@ -166,34 +166,11 @@ function makeApi({
       });
     },
 
-    async chatNonStream(args: {
-      threadId: string;
-      text: string;
-      clientMsgId: string;
-      web: boolean;
-      signal: AbortSignal;
-    }): Promise<{ text?: string }> {
-      if (!apiBase) throw new Error("Missing VITE_API_BASE");
-      return fetchJson(`${apiBase}/chat`, {
-        method: "POST",
-        signal: args.signal,
-        headers: { ...headersAccess, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          threadId: args.threadId,
-          text: args.text,
-          clientMsgId: args.clientMsgId,
-          // send both (some backends use one name)
-          web: args.web,
-          browse: args.web,
-        }),
-      });
-    },
-
     async chatStreamFetch(args: {
       threadId: string;
       text: string;
       clientMsgId: string;
-      web: boolean;
+      webEnabled: boolean;
       signal: AbortSignal;
     }): Promise<Response> {
       if (!streamApiBase) throw new Error("Missing VITE_STREAM_API_BASE");
@@ -208,8 +185,9 @@ function makeApi({
           threadId: args.threadId,
           text: args.text,
           clientMsgId: args.clientMsgId,
-          web: args.web,
-          browse: args.web,
+          capabilities: {
+            web_search: args.webEnabled,
+          },
         }),
       });
     },
@@ -455,20 +433,16 @@ function AssistantMarkdown({
 }
 
 /* =========================
-   Composer component
+   Composer component (streaming default; no stream toggle)
 ========================= */
 function Composer({
   disabled,
   onSend,
-  streamEnabled,
-  onToggleStream,
   webEnabled,
   onToggleWeb,
 }: {
   disabled?: boolean;
   onSend: (text: string) => Promise<void>;
-  streamEnabled: boolean;
-  onToggleStream: (v: boolean) => void;
   webEnabled: boolean;
   onToggleWeb: (v: boolean) => void;
 }) {
@@ -506,32 +480,6 @@ function Composer({
           outline: "none",
         }}
       />
-
-      <label
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          fontSize: 12,
-          opacity: disabled ? 0.5 : 0.9,
-          userSelect: "none",
-          cursor: disabled ? "not-allowed" : "pointer",
-          border: "1px solid #333",
-          borderRadius: 10,
-          padding: "8px 10px",
-          background: "#111",
-        }}
-        title="Use streaming endpoint"
-      >
-        <input
-          type="checkbox"
-          checked={streamEnabled}
-          disabled={disabled}
-          onChange={(e) => onToggleStream(e.target.checked)}
-          style={{ cursor: disabled ? "not-allowed" : "pointer" }}
-        />
-        Stream
-      </label>
 
       <label
         style={{
@@ -585,14 +533,12 @@ function useChatRuntime({
   streamApiBase,
   accessToken,
   idToken,
-  streamEnabled,
   webEnabled,
 }: {
   apiBase?: string;
   streamApiBase?: string;
   accessToken: string;
   idToken: string;
-  streamEnabled: boolean;
   webEnabled: boolean;
 }) {
   const headersAccess = useMemo(
@@ -647,6 +593,7 @@ function useChatRuntime({
     if (tid) {
       abortInFlight();
       setThreadId(tid);
+      activeThreadRef.current = tid;
       await refreshThreads();
     }
   }, [api, apiBase, abortInFlight, refreshThreads]);
@@ -692,7 +639,10 @@ function useChatRuntime({
 
   const appendAssistantPlaceholder = useCallback((initial = "Thinking…") => {
     const assistantId = `m_${safeUUID()}`;
-    setHistory((h) => [...h, { id: assistantId, ts: Date.now(), role: "assistant", text: initial }]);
+    setHistory((h) => [
+      ...h,
+      { id: assistantId, ts: Date.now(), role: "assistant", text: initial },
+    ]);
     return assistantId;
   }, []);
 
@@ -722,7 +672,6 @@ function useChatRuntime({
           if (activeThreadRef.current !== tid) return;
 
           const msgs = Array.isArray(thread?.messages) ? thread.messages : [];
-          // Find the first assistant message after the user's send timestamp
           const candidates = msgs
             .filter((m) => m.role === "assistant" && typeof m.ts === "number" && m.ts >= userTs)
             .sort((a, b) => a.ts - b.ts);
@@ -730,8 +679,12 @@ function useChatRuntime({
           const latest = candidates[candidates.length - 1];
           const text = normalizeText(latest?.text);
 
-          // stop when we get something real and different
-          if (text && !looksLikeBrowsingPlaceholder(text) && text !== "Thinking…" && text !== lastSeen) {
+          if (
+            text &&
+            !looksLikeBrowsingPlaceholder(text) &&
+            text !== "Thinking…" &&
+            text !== lastSeen
+          ) {
             updateAssistantText(assistantId, text);
             refreshThreads().catch(() => {});
             return;
@@ -746,56 +699,6 @@ function useChatRuntime({
       }
     },
     [api, refreshThreads, updateAssistantText]
-  );
-
-  const sendMessageNonStream = useCallback(
-    async (text: string, tid: string) => {
-      abortInFlight();
-      const { clientMsgId, userTs } = appendOptimisticUser(text);
-      const assistantId = appendAssistantPlaceholder("Thinking…");
-
-      const controller = new AbortController();
-      inFlightAbortRef.current = controller;
-
-      try {
-        const data = await api.chatNonStream({
-          threadId: tid,
-          text,
-          clientMsgId,
-          web: webEnabled,
-          signal: controller.signal,
-        });
-
-        if (activeThreadRef.current !== tid) return;
-
-        const assistantText = normalizeText(data?.text);
-        if (!assistantText || looksLikeBrowsingPlaceholder(assistantText)) {
-          // Show what we got, then poll for the real answer
-          if (assistantText) updateAssistantText(assistantId, assistantText);
-          await pollForFinalAssistant(tid, userTs, assistantId, controller.signal);
-        } else {
-          updateAssistantText(assistantId, assistantText);
-          refreshThreads().catch(() => {});
-        }
-      } catch (e: any) {
-        if (isAbortError(e) || activeThreadRef.current !== tid) return;
-        replaceAssistantWithError(assistantId, e?.message ?? String(e));
-        throw e;
-      } finally {
-        if (inFlightAbortRef.current === controller) inFlightAbortRef.current = null;
-      }
-    },
-    [
-      api,
-      webEnabled,
-      abortInFlight,
-      appendOptimisticUser,
-      appendAssistantPlaceholder,
-      updateAssistantText,
-      replaceAssistantWithError,
-      refreshThreads,
-      pollForFinalAssistant,
-    ]
   );
 
   const sendMessageStream = useCallback(
@@ -819,7 +722,7 @@ function useChatRuntime({
           threadId: tid,
           text,
           clientMsgId,
-          web: webEnabled,
+          webEnabled,
           signal: controller.signal,
         });
 
@@ -870,21 +773,17 @@ function useChatRuntime({
 
         const finalText = acc.trim();
 
-        // If the stream never produced text (decoder mismatch previously),
-        // OR if it only produced the browsing placeholder, poll for final message.
         if (!gotAnyByte) {
           updateAssistantText(assistantId, "⚠️ stream ended with no content");
           return;
         }
 
         if (!sawAnyText) {
-          // We got bytes but decoded nothing -> poll
           await pollForFinalAssistant(tid, userTs, assistantId, controller.signal);
           return;
         }
 
         if (!finalText || looksLikeBrowsingPlaceholder(finalText)) {
-          // Show placeholder, then poll for real stored answer
           if (finalText) updateAssistantText(assistantId, finalText);
           await pollForFinalAssistant(tid, userTs, assistantId, controller.signal);
           return;
@@ -914,33 +813,29 @@ function useChatRuntime({
     ]
   );
 
+  // Streaming-first; if STREAM base missing, show error message (no fake fallback).
   const onSend = useCallback(
     async (text: string) => {
       if (!threadId) throw new Error("No thread selected");
       const tid = threadId;
       activeThreadRef.current = tid;
 
-      if (streamEnabled && streamApiBase) {
-        try {
-          await sendMessageStream(text, tid);
-          return;
-        } catch (e: any) {
-          if (activeThreadRef.current !== tid) return;
-          setHistory((h) => [
-            ...h,
-            {
-              id: `m_${safeUUID()}`,
-              ts: Date.now(),
-              role: "assistant",
-              text: `⚠️ streaming failed, falling back to non-stream.\n${e?.message ?? String(e)}`,
-            },
-          ]);
-        }
+      if (!streamApiBase) {
+        setHistory((h) => [
+          ...h,
+          {
+            id: `m_${safeUUID()}`,
+            ts: Date.now(),
+            role: "assistant",
+            text: "⚠️ Streaming endpoint is not configured (missing VITE_STREAM_API_BASE).",
+          },
+        ]);
+        return;
       }
 
-      await sendMessageNonStream(text, tid);
+      await sendMessageStream(text, tid);
     },
-    [threadId, streamEnabled, streamApiBase, sendMessageStream, sendMessageNonStream]
+    [threadId, streamApiBase, sendMessageStream]
   );
 
   // initial load
@@ -960,6 +855,7 @@ function useChatRuntime({
         if (initial && !threadId) {
           abortInFlight();
           setThreadId(initial);
+          activeThreadRef.current = initial;
         }
       } catch (e: any) {
         if (!alive) return;
@@ -1010,7 +906,6 @@ export default function ChatApp({
   const API_BASE = import.meta.env.VITE_API_BASE as string | undefined;
   const STREAM_API_BASE = import.meta.env.VITE_STREAM_API_BASE as string | undefined;
 
-  const [streamEnabled, setStreamEnabled] = useState(true);
   const [webEnabled, setWebEnabled] = useState(true);
 
   const { copiedKey, copyToClipboard } = useClipboardToast(1200);
@@ -1033,7 +928,6 @@ export default function ChatApp({
     streamApiBase: STREAM_API_BASE,
     accessToken,
     idToken,
-    streamEnabled,
     webEnabled,
   });
 
@@ -1140,7 +1034,7 @@ export default function ChatApp({
             </div>
           )}
 
-          {streamEnabled && !STREAM_API_BASE && (
+          {!STREAM_API_BASE && (
             <div style={{ color: "#ff7b7b", fontSize: 12 }}>
               Streaming is ON but VITE_STREAM_API_BASE is missing.
             </div>
@@ -1194,13 +1088,10 @@ export default function ChatApp({
           <div ref={bottomRef} />
         </div>
 
-        {/* Composer */}
         <div style={{ borderTop: "1px solid #222" }}>
           <Composer
             disabled={hydrating || !threadId}
             onSend={onSend}
-            streamEnabled={streamEnabled}
-            onToggleStream={setStreamEnabled}
             webEnabled={webEnabled}
             onToggleWeb={setWebEnabled}
           />
