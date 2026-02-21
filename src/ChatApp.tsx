@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import "highlight.js/styles/github-dark.css";
+import React from "react";
 
 /* =========================
    Types
@@ -82,6 +83,27 @@ function looksLikeBrowsingPlaceholder(s: string) {
 /* =========================
    Clipboard hook
 ========================= */
+
+
+function extractTextFromReact(node: any): string {
+  if (node == null || node === false) return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+
+  // Arrays of children
+  if (Array.isArray(node)) return node.map(extractTextFromReact).join("");
+
+  // React element (from syntax highlighting spans, etc.)
+  if (React.isValidElement(node)) {
+    return extractTextFromReact((node as any).props?.children);
+  }
+
+  // Fallback (handles weird cases)
+  try {
+    return String(node);
+  } catch {
+    return "";
+  }
+}
 function useClipboardToast(timeoutMs = 1200) {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
@@ -340,15 +362,20 @@ function AssistantMarkdown({
         pre({ children }) {
           const codeNode: any = Array.isArray(children) ? children[0] : children;
 
-          const raw =
-            typeof codeNode?.props?.children === "string"
-              ? codeNode.props.children
-              : Array.isArray(codeNode?.props?.children)
-              ? codeNode.props.children.join("")
-              : "";
+          // NOTE: with rehype-highlight, this is often React elements, not strings
+          const rawChildren = codeNode?.props?.children;
 
-          const codeText = String(raw ?? "").replace(/\n$/, "");
+          const codeText = extractTextFromReact(rawChildren).replace(/\n$/, "");
           const key = `${msgId}:pre:${codeText.length}`;
+          // const raw =
+          //   typeof codeNode?.props?.children === "string"
+          //     ? codeNode.props.children
+          //     : Array.isArray(codeNode?.props?.children)
+          //     ? codeNode.props.children.join("")
+          //     : "";
+
+          // const codeText = String(raw ?? "").replace(/\n$/, "");
+          // const key = `${msgId}:pre:${codeText.length}`;
 
           return (
             <div style={{ position: "relative", margin: "8px 0" }}>
