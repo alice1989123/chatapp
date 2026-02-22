@@ -83,27 +83,23 @@ function looksLikeBrowsingPlaceholder(s: string) {
 /* =========================
    Clipboard hook
 ========================= */
-
-
 function extractTextFromReact(node: any): string {
   if (node == null || node === false) return "";
   if (typeof node === "string" || typeof node === "number") return String(node);
 
-  // Arrays of children
   if (Array.isArray(node)) return node.map(extractTextFromReact).join("");
 
-  // React element (from syntax highlighting spans, etc.)
   if (React.isValidElement(node)) {
     return extractTextFromReact((node as any).props?.children);
   }
 
-  // Fallback (handles weird cases)
   try {
     return String(node);
   } catch {
     return "";
   }
 }
+
 function useClipboardToast(timeoutMs = 1200) {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
@@ -235,12 +231,17 @@ function createStreamTimers() {
     firstByteTimer = window.setTimeout(onTimeout, ms);
   };
 
+  const disarmFirstByte = () => {
+    if (firstByteTimer) window.clearTimeout(firstByteTimer);
+    firstByteTimer = null;
+  };
+
   const armProgress = (ms: number, onTimeout: () => void) => {
     if (progressTimer) window.clearTimeout(progressTimer);
     progressTimer = window.setTimeout(onTimeout, ms);
   };
 
-  return { clear, armFirstByte, armProgress };
+  return { clear, armFirstByte, disarmFirstByte, armProgress };
 }
 
 /* =========================
@@ -273,13 +274,11 @@ function createHybridStreamDecoder() {
     return -1;
   }
 
-  // If delimiter never appears, don't buffer forever.
-  const MAX_META_BYTES = 32 * 1024; // 32KB is plenty for meta
+  const MAX_META_BYTES = 32 * 1024;
 
   function firstNonWhitespaceByte(u8: Uint8Array) {
     for (let i = 0; i < u8.length; i++) {
       const c = u8[i];
-      // whitespace bytes: space/tab/cr/lf
       if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) continue;
       return c;
     }
@@ -292,8 +291,6 @@ function createHybridStreamDecoder() {
 
       buf = concat(buf, bytes);
 
-      // Heuristic: if the first non-whitespace byte is NOT "{",
-      // then this is almost certainly plain text streaming, not meta JSON.
       if (!startedBody && !decidedPlainText) {
         const b = firstNonWhitespaceByte(buf);
         if (b !== null && b !== 0x7b /* "{" */) {
@@ -304,7 +301,6 @@ function createHybridStreamDecoder() {
 
       if (!startedBody) {
         if (buf.length > MAX_META_BYTES) {
-          // treat as body if meta is too large / delimiter missing
           startedBody = true;
           const text = td.decode(buf, { stream: true });
           buf = new Uint8Array(0);
@@ -312,9 +308,7 @@ function createHybridStreamDecoder() {
         }
 
         const at = indexOfSubarray(buf, DELIM);
-        if (at === -1) {
-          return { text: "" };
-        }
+        if (at === -1) return { text: "" };
 
         let meta: any = undefined;
         try {
@@ -332,7 +326,6 @@ function createHybridStreamDecoder() {
         return { text, meta };
       }
 
-      // Body mode (plain or post-delim)
       const text = td.decode(buf, { stream: true });
       buf = new Uint8Array(0);
       return { text };
@@ -361,21 +354,10 @@ function AssistantMarkdown({
       components={{
         pre({ children }) {
           const codeNode: any = Array.isArray(children) ? children[0] : children;
-
-          // NOTE: with rehype-highlight, this is often React elements, not strings
           const rawChildren = codeNode?.props?.children;
 
           const codeText = extractTextFromReact(rawChildren).replace(/\n$/, "");
           const key = `${msgId}:pre:${codeText.length}`;
-          // const raw =
-          //   typeof codeNode?.props?.children === "string"
-          //     ? codeNode.props.children
-          //     : Array.isArray(codeNode?.props?.children)
-          //     ? codeNode.props.children.join("")
-          //     : "";
-
-          // const codeText = String(raw ?? "").replace(/\n$/, "");
-          // const key = `${msgId}:pre:${codeText.length}`;
 
           return (
             <div style={{ position: "relative", margin: "8px 0" }}>
@@ -460,7 +442,7 @@ function AssistantMarkdown({
 }
 
 /* =========================
-   Composer component (streaming default; no stream toggle)
+   Composer component
 ========================= */
 function Composer({
   disabled,
@@ -762,11 +744,28 @@ function useChatRuntime({
         const decoder = createHybridStreamDecoder();
 
         let acc = "";
+        let pending = "";
+        let flushTimer: number | null = null;
+
         let gotAnyByte = false;
         let sawAnyText = false;
 
-        timers.armFirstByte(8_000, abort);
-        timers.armProgress(25_000, abort);
+        const flush = () => {
+          if (!pending) return;
+          acc += pending;
+          pending = "";
+          updateAssistantText(assistantId, acc || "Thinking…");
+        };
+
+        const scheduleFlush = () => {
+          if (flushTimer != null) return;
+          flushTimer = window.setTimeout(() => {
+            flushTimer = null;
+            flush();
+          }, 50); // tune: 30–80ms
+        };
+
+        timers.armFirstByte(30_000, abort);
 
         while (true) {
           const { value, done } = await reader.read();
@@ -781,19 +780,28 @@ function useChatRuntime({
           }
 
           if (value && value.length) {
-            gotAnyByte = true;
-            timers.armProgress(25_000, abort);
+            if (!gotAnyByte) {
+              gotAnyByte = true;
+              timers.disarmFirstByte();
+              timers.armProgress(120_000, abort); // give room for long generations
+            } else {
+              timers.armProgress(120_000, abort);
+            }
           }
 
           const { text: chunkText } = decoder.push(value);
 
           if (chunkText) {
             sawAnyText = true;
-            acc += chunkText;
-            updateAssistantText(assistantId, acc || "Thinking…");
+            pending += chunkText;
+
+            if (pending.length >= 2048) flush();
+            else scheduleFlush();
           }
         }
 
+        if (flushTimer != null) window.clearTimeout(flushTimer);
+        flush();
         timers.clear();
 
         if (activeThreadRef.current !== tid) return;
@@ -840,7 +848,6 @@ function useChatRuntime({
     ]
   );
 
-  // Streaming-first; if STREAM base missing, show error message (no fake fallback).
   const onSend = useCallback(
     async (text: string) => {
       if (!threadId) throw new Error("No thread selected");
@@ -958,10 +965,10 @@ export default function ChatApp({
     webEnabled,
   });
 
-  // autoscroll
+  // autoscroll (use auto during streaming updates to avoid jank)
   const bottomRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    bottomRef.current?.scrollIntoView({ behavior: "auto" });
   }, [history, threadId]);
 
   return (
