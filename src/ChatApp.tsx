@@ -449,12 +449,16 @@ function Composer({
   onSend,
   webEnabled,
   onToggleWeb,
+  onStop,
+  canStop,
 }: {
   disabled?: boolean;
   onSend: (text: string) => Promise<void>;
   webEnabled: boolean;
   onToggleWeb: (v: boolean) => void;
-}) {
+  onStop: () => void;
+  canStop: boolean;
+})  {
   const [text, setText] = useState("");
 
   return (
@@ -530,6 +534,22 @@ function Composer({
       >
         Send
       </button>
+      <button
+      type="button"
+      onClick={onStop}
+      disabled={!canStop}
+      style={{
+        padding: "10px 14px",
+        borderRadius: 10,
+        border: "1px solid #333",
+        background: !canStop ? "#222" : "#111",
+        color: "white",
+        cursor: !canStop ? "not-allowed" : "pointer",
+      }}
+      title="Stop generating"
+    >
+      Stop
+    </button>
     </form>
   );
 }
@@ -570,20 +590,35 @@ function useChatRuntime({
   const [history, setHistory] = useState<BackendMsg[]>([]);
   const [hydrating, setHydrating] = useState(false);
   const [hydrateError, setHydrateError] = useState<string | null>(null);
-
+  const [isStreaming, setIsStreaming] = useState(false);
   const activeThreadRef = useRef<string | null>(null);
   const inFlightAbortRef = useRef<AbortController | null>(null);
 
   const abortInFlight = useCallback(() => {
-    try {
-      inFlightAbortRef.current?.abort();
-    } catch {}
+    const ctrl = inFlightAbortRef.current;
+    if (!ctrl) return;
+
+    // update UI immediately no matter what
+    setHistory((h) => {
+      const hh = [...h];
+      for (let i = hh.length - 1; i >= 0; i--) {
+        if (hh[i].role === "assistant") {
+          hh[i] = { ...hh[i], text: "⏹️ Stopped." };
+          break;
+        }
+      }
+      return hh;
+    });
+
+    try { ctrl.abort(); } catch {}
+
     inFlightAbortRef.current = null;
+    setIsStreaming(false);
   }, []);
 
   useEffect(() => {
     return () => abortInFlight();
-  }, [abortInFlight]);
+  }, [abortInFlight ]);
 
   const refreshThreads = useCallback(async () => {
     if (!apiBase) return [];
@@ -711,29 +746,29 @@ function useChatRuntime({
   );
 
   const sendMessageStream = useCallback(
-    async (text: string, tid: string) => {
-      abortInFlight();
-      const { clientMsgId, userTs } = appendOptimisticUser(text);
-      const assistantId = appendAssistantPlaceholder("Thinking…");
+        async (text: string, tid: string) => {
+        abortInFlight();
 
-      const controller = new AbortController();
-      inFlightAbortRef.current = controller;
+        const { clientMsgId, userTs } = appendOptimisticUser(text);
+        const assistantId = appendAssistantPlaceholder("Thinking…");
 
-      const timers = createStreamTimers();
-      const abort = () => {
+        const controller = new AbortController();
+        inFlightAbortRef.current = controller;
+        setIsStreaming(true); // <-- move here (after ref is set)
+
+        const timers = createStreamTimers();
+        const abort = () => {
+          try { controller.abort(); } catch {}
+        };
+
         try {
-          controller.abort();
-        } catch {}
-      };
-
-      try {
-        const r = await api.chatStreamFetch({
-          threadId: tid,
-          text,
-          clientMsgId,
-          webEnabled,
-          signal: controller.signal,
-        });
+          const r = await api.chatStreamFetch({
+            threadId: tid,
+            text,
+            clientMsgId,
+            webEnabled,
+            signal: controller.signal,
+          });
 
         if (!r.ok || !r.body) {
           const raw = await r.text().catch(() => "");
@@ -832,6 +867,7 @@ function useChatRuntime({
         throw e;
       } finally {
         timers.clear();
+        setIsStreaming(false);
         if (inFlightAbortRef.current === controller) inFlightAbortRef.current = null;
       }
     },
@@ -910,7 +946,7 @@ function useChatRuntime({
     if (!threadId) return;
     hydrateThread(threadId);
   }, [threadId, hydrateThread]);
-
+  const canStop = isStreaming || !!inFlightAbortRef.current;
   return {
     threadId,
     setThreadId,
@@ -924,6 +960,8 @@ function useChatRuntime({
     hydrateError,
     abortInFlight,
     onSend,
+    isStreaming,
+    canStop,
   };
 }
 
@@ -940,7 +978,7 @@ export default function ChatApp({
   const API_BASE = import.meta.env.VITE_API_BASE as string | undefined;
   const STREAM_API_BASE = import.meta.env.VITE_STREAM_API_BASE as string | undefined;
 
-  const [webEnabled, setWebEnabled] = useState(true);
+  const [webEnabled, setWebEnabled] = useState(false);
 
   const { copiedKey, copyToClipboard } = useClipboardToast(1200);
 
@@ -957,6 +995,8 @@ export default function ChatApp({
     hydrateError,
     abortInFlight,
     onSend,
+    isStreaming,
+    canStop,
   } = useChatRuntime({
     apiBase: API_BASE,
     streamApiBase: STREAM_API_BASE,
@@ -1128,6 +1168,8 @@ export default function ChatApp({
             onSend={onSend}
             webEnabled={webEnabled}
             onToggleWeb={setWebEnabled}
+            onStop={abortInFlight}
+            canStop={canStop}
           />
         </div>
       </div>
