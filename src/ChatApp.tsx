@@ -995,7 +995,6 @@ export default function ChatApp({
     hydrateError,
     abortInFlight,
     onSend,
-    isStreaming,
     canStop,
   } = useChatRuntime({
     apiBase: API_BASE,
